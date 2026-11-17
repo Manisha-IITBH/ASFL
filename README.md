@@ -1,5 +1,7 @@
 # Adaptive Split Federated Learning (ASFL)
 
+> **Accepted at CODS 2026**
+
 A PyTorch framework for **split federated learning** with **personalisation** and **out-of-distribution (OOD) aware inference**. Each client runs the front part of a network locally, the server trains the shared back part, and clients can then personalise their models while the framework decides — per sample or per batch — whether to use the generalised or the personalised model.
 
 The framework uses a **key-value store** of front-model activations so the server can train without repeatedly re-running client forward passes, which makes split training cheaper in compute and communication.
