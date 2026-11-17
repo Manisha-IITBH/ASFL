@@ -1,0 +1,197 @@
+
+fit function used for testing:
+
+def fit(self,):
+        """
+        - trains and tests the models for given num. of epochs
+        """
+
+        if self.pooling_mode:
+            print('\n\nPOOLING MODE: ENABLED!')
+
+        self._create_save_dir()
+        # disabled freeing GPU mem since key-value store needs to be refreshed
+        # print('freeing some GPU...')
+        # self.remove_frozen_models()
+
+        # if key value store refresh rate = 0, it is disabled
+        if self.args.kv_refresh_rate == 0:
+            self.populate_key_value_store()
+            self.clear_cache()
+        
+        
+        print(f'{"-"*25}\n\ncommence training...\n\n')
+
+        for epoch in tqdm(range(self.args.epochs)):
+            
+            if self.early_stop:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+            wandb.log({'epoch':epoch})
+
+            # load the best models before starting of local epoch training among clients
+            if epoch>0:
+                self.load_best_models()
+
+            for c_id in self.client_ids:
+                self.clients[c_id].back_model.train()
+                self.sc_clients[c_id].center_back_model.train()
+
+            self.train_one_epoch(epoch)
+            self.clear_cache()
+        
+            for c_id in self.client_ids:
+                self.clients[c_id].back_model.eval()
+                self.sc_clients[c_id].center_back_model.eval()
+            
+            for c_id in self.client_ids:
+                self.initial_hashes_sb[c_id] = hash_model(self.sc_clients[c_id].center_back_model)
+                self.initial_hashes_cb[c_id] = hash_model(self.clients[c_id].back_model)
+            
+            should_save = self.test_one_epoch(epoch)
+            
+            print(should_save)
+            if should_save:
+                self.early_stop = False
+                print("Model improved and saved.")
+                
+                self.save_models(epoch) 
+                #----------------------------debug1--------------------------
+                current_hashes_sb = dict()
+                current_hashes_cb = dict()
+                for c_id in self.client_ids:
+                    current_hashes_sb[c_id] = hash_model(self.sc_clients[c_id].center_back_model)
+                    current_hashes_cb[c_id] = hash_model(self.clients[c_id].back_model)
+                all_hashes_match_sb = all(self.initial_hashes_sb[c_id] == current_hashes_sb[c_id] for c_id in self.client_ids)
+                all_hashes_match_cb = all(self.initial_hashes_cb[c_id] == current_hashes_cb[c_id] for c_id in self.client_ids)
+                if all_hashes_match_sb:
+                    print("server back hashes are consistent after saving models")
+                    if all_hashes_match_cb:
+                        print("client back hashes are consistent after saving models")
+                        self.save_models(epoch)
+                    else:
+                        print("!!!!!!!!!!!! client back hashes are inconsistent after saving models")
+                else:
+                    print("!!!!!!!!!!!! server back hashes are inconsistent after saving models")
+                #------------------------------------------------------------
+                self.load_best_models()
+                
+                #----------------------------debug1--------------------------
+                current_hashes_sb1 = dict()
+                current_hashes_cb1 = dict()
+                for c_id in self.client_ids:
+                    current_hashes_sb1[c_id] = hash_model(self.sc_clients[c_id].center_back_model)
+                    current_hashes_cb1[c_id] = hash_model(self.clients[c_id].back_model)
+                    
+                all_hashes_match_sb = all(current_hashes_sb1[c_id] == current_hashes_sb[c_id] for c_id in self.client_ids)
+                print([current_hashes_sb1[c_id] == current_hashes_sb[c_id] for c_id in self.client_ids])
+                
+                all_hashes_match_cb = all(current_hashes_cb1[c_id] == current_hashes_cb[c_id] for c_id in self.client_ids)
+                print([current_hashes_cb1[c_id] == current_hashes_cb[c_id] for c_id in self.client_ids])
+                
+                if all_hashes_match_sb:
+                    print("server back hashes are consistent after loading models")
+                    if all_hashes_match_cb:
+                        print("client back hashes are consistent after loading models")
+                        self.save_models(epoch)
+                    else:
+                        print("!!!!!!!!!!!! client back hashes are inconsistent after loading models")
+                        
+                else:
+                    print("!!!!!!!!!!!! server back hashes are inconsistent after loading models")
+                #------------------------------------------------------------
+                self.inference()
+                #self.save_kv() # for personalisation phase
+            else:
+                if self.early_stop_counter == 5:
+                    self.early_stop = True
+    
+            self.clear_cache()
+        
+        # final metrics of generalization phase  
+        self.load_best_models()
+        for c_id in self.client_ids:
+            self.initial_hashes_sb[c_id] = hash_model(self.sc_clients[c_id].center_back_model)
+            self.initial_hashes_cb[c_id] = hash_model(self.clients[c_id].back_model)
+
+        print(f'\n\n\n{"::"*10}BEST TEST PERFORMANCE{"::"*10}')
+        self.inference()
+
+        for run in range(6):
+            if run>0:
+                self.sc_clients[c_id].discriminator.load_state_dict(torch.load(self.save_dir / f'client_{c_id}_{self.args.model}_discriminator.pth', weights_only=True, map_location=self.device))
+            for c_id in self.client_ids:
+                self.sc_clients[c_id].center_back_model.eval()
+                self.sc_clients[c_id].discriminator.train()
+            self.train_one_epoch_discriminator(run)
+            for c_id in self.client_ids:
+                self.sc_clients[c_id].discriminator.eval()
+            r = self.test_one_epoch_disc(run)
+            if r==True:
+                for c_id in self.client_ids:
+                    disc_state_dict = copy.deepcopy(self.sc_clients[c_id].discriminator.state_dict())
+                    torch.save(disc_state_dict, self.save_dir / f'client_{c_id}_{self.args.model}_discriminator.pth')
+            else:
+                if self.early_stop_counter_disc == 5:
+                    print(f"early stopping discriminator training at epoch-{run}")
+                    break
+        
+        print("Batchwise_Discriminator_loss:")
+        print(self.disc_batchwise_losses)
+        print("clients thresholds:",self.clients_threshold)
+        
+        if self.personalize:
+            # load best generalization phase models before personalization phase in server back and client back
+            self.load_best_models()
+            self.personalization_mode = True
+            print("Personalization Started")
+            self.save_kv_contrastive()
+            self.personalize(epoch)
+            for epoch in tqdm(range(epoch,self.args.epochs)):
+                for c_id in self.client_ids:
+                    self.clients[c_id].back_model.train()
+                    self.sc_clients[c_id].center_back_model.eval()
+                self.train_one_epoch_personalise(epoch)
+                #----------------------------debug1--------------------------
+                current_hashes_sb = dict()
+                current_hashes_cb = dict()
+                for c_id in self.client_ids:
+                    current_hashes_sb[c_id] = hash_model(self.sc_clients[c_id].center_back_model)
+                    current_hashes_cb[c_id] = hash_model(self.clients[c_id].back_model)
+                all_hashes_match_sb = all(self.initial_hashes_sb[c_id] == current_hashes_sb[c_id] for c_id in self.client_ids)
+                all_hashes_match_cb = all(self.initial_hashes_cb[c_id] == current_hashes_cb[c_id] for c_id in self.client_ids)
+                print("Server Back is Same? ->", all_hashes_match_sb)
+                print("CLient Back is Same? ->", all_hashes_match_cb)
+                #------------------------------------------------------------
+                self.clear_cache()
+                for c_id in self.client_ids:
+                    self.clients[c_id].back_model.eval()
+                self.test_one_epoch_personalise(epoch)
+                #----------------------------debug2--------------------------
+                current_hashes_sb = dict()
+                current_hashes_cb = dict()
+                for c_id in self.client_ids:
+                    current_hashes_sb[c_id] = hash_model(self.sc_clients[c_id].center_back_model)
+                    current_hashes_cb[c_id] = hash_model(self.clients[c_id].back_model)
+                all_hashes_match_sb = all(self.initial_hashes_sb[c_id] == current_hashes_sb[c_id] for c_id in self.client_ids)
+                all_hashes_match_cb = all(self.initial_hashes_cb[c_id] == current_hashes_cb[c_id] for c_id in self.client_ids)
+                print("Server Back is Same? ->", all_hashes_match_sb)
+                print("CLient Back is Same? ->", all_hashes_match_cb)
+                #------------------------------------------------------------
+                self.clear_cache()
+                
+                self.save_models(epoch)
+                self.load_best_models()
+                self.inference()
+                #----------------------------debug3--------------------------
+                current_hashes_sb = dict()
+                current_hashes_cb = dict()
+                for c_id in self.client_ids:
+                    current_hashes_sb[c_id] = hash_model(self.sc_clients[c_id].center_back_model)
+                    current_hashes_cb[c_id] = hash_model(self.clients[c_id].back_model)
+                all_hashes_match_sb = all(self.initial_hashes_sb[c_id] == current_hashes_sb[c_id] for c_id in self.client_ids)
+                all_hashes_match_cb = all(self.initial_hashes_cb[c_id] == current_hashes_cb[c_id] for c_id in self.client_ids)
+                print("Server Back is Same? ->", all_hashes_match_sb)
+                print("CLient Back is Same? ->", all_hashes_match_cb)
+                #------------------------------------------------------------
